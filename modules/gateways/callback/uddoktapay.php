@@ -2,131 +2,156 @@
 /**
  * UddoktaPay IPN / Webhook Callback Handler
  *
- * UddoktaPay POSTs payment data to this URL after a transaction.
- * This script verifies the payment via the UddoktaPay API and
- * marks the corresponding WHMCS invoice as paid.
+ * UddoktaPay POSTs payment data to this URL after a transaction completes.
+ * This script verifies the payment server-side via the UddoktaPay API,
+ * then marks the corresponding WHMCS invoice as paid.
  *
- * Callback URL (set as webhook_url in payment request):
+ * Webhook URL (auto-configured in payment request):
  *   https://yourwhmcs.com/modules/gateways/callback/uddoktapay.php
  *
- * Compatible with PHP 7.4+ and WHMCS 7.x / 8.x
+ * @requires  PHP    7.4 or higher
+ * @requires  WHMCS  7.4 or higher
  */
 
-// Boot WHMCS
-require_once __DIR__ . '/../../../init.php';
-require_once __DIR__ . '/../../../includes/gatewayfunctions.php';
-require_once __DIR__ . '/../../../includes/invoicefunctions.php';
+// Bootstrap WHMCS — paths go 3 levels up from /modules/gateways/callback/
+require_once dirname(dirname(dirname(__DIR__))) . '/init.php';
+require_once dirname(dirname(dirname(__DIR__))) . '/includes/gatewayfunctions.php';
+require_once dirname(dirname(dirname(__DIR__))) . '/includes/invoicefunctions.php';
 
-// Identify this gateway module
+// Gateway module identifier — must match the filename: uddoktapay.php
 $gatewayModuleName = 'uddoktapay';
 
-// Load gateway configuration (API Key, API URL)
+// Load this gateway's saved configuration from the WHMCS database
 $gatewayParams = getGatewayVariables($gatewayModuleName);
 
-if (!$gatewayParams['type']) {
-    die('UddoktaPay module is not activated.');
+// Abort if the module is not activated in WHMCS
+if (empty($gatewayParams['type'])) {
+    die('UddoktaPay: Module is not activated in WHMCS Payment Gateways.');
 }
 
-$apiKey = $gatewayParams['apiKey'];
-$apiUrl = rtrim($gatewayParams['apiUrl'], '/');
+$apiKey = isset($gatewayParams['apiKey']) ? trim($gatewayParams['apiKey']) : '';
+$apiUrl = isset($gatewayParams['apiUrl']) ? rtrim(trim($gatewayParams['apiUrl']), '/') : '';
 
-// -----------------------------------------------------------------------
-// Step 1 — Read incoming IPN data from UddoktaPay
-// UddoktaPay sends a JSON POST body to this URL.
-// -----------------------------------------------------------------------
+if (empty($apiKey) || empty($apiUrl)) {
+    die('UddoktaPay: API Key or API URL is not configured.');
+}
+
+// ---------------------------------------------------------------------------
+// STEP 1 — Read the IPN payload sent by UddoktaPay
+//
+// UddoktaPay sends a JSON POST body. Some server configurations parse it into
+// $_POST instead, so we check both sources.
+// ---------------------------------------------------------------------------
 $rawInput = file_get_contents('php://input');
 $ipnData  = json_decode($rawInput, true);
 
-// Fallback: some servers may parse it into $_POST
 if (empty($ipnData) && !empty($_POST)) {
     $ipnData = $_POST;
 }
 
-// The UddoktaPay invoice ID comes in the IPN body
-$uddoktaInvoiceId = isset($ipnData['invoice_id']) ? trim($ipnData['invoice_id']) : '';
-
-if (empty($uddoktaInvoiceId)) {
-    logTransaction($gatewayModuleName, $ipnData, 'Failed: Missing invoice_id in IPN payload');
-    http_response_code(400);
-    die('Invalid IPN: invoice_id is missing.');
+// Ensure we received at least an empty array
+if (!is_array($ipnData)) {
+    $ipnData = array();
 }
 
-// -----------------------------------------------------------------------
-// Step 2 — Verify the payment with UddoktaPay API
-// Never trust the IPN payload alone — always re-verify server-side.
-// -----------------------------------------------------------------------
+// The UddoktaPay payment reference (their invoice ID)
+$uddoktaInvoiceId = isset($ipnData['invoice_id']) ? trim($ipnData['invoice_id']) : '';
+
+if ($uddoktaInvoiceId === '') {
+    logTransaction($gatewayModuleName, $ipnData, 'Failed: invoice_id missing from IPN');
+    http_response_code(400);
+    die('Bad request: invoice_id is required.');
+}
+
+// ---------------------------------------------------------------------------
+// STEP 2 — Verify the payment server-side via UddoktaPay API
+//
+// NEVER trust the IPN payload alone. Always re-confirm with the API.
+// ---------------------------------------------------------------------------
+$verifyPayload = json_encode(array('invoice_id' => $uddoktaInvoiceId));
+
 $ch = curl_init();
-curl_setopt_array($ch, [
-    CURLOPT_URL            => $apiUrl . '/api/verify-payment',
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_POST           => true,
-    CURLOPT_POSTFIELDS     => json_encode(['invoice_id' => $uddoktaInvoiceId]),
-    CURLOPT_HTTPHEADER     => [
-        'RT-UDDOKTAPAY-API-KEY: ' . $apiKey,
-        'Content-Type: application/json',
-        'Accept: application/json',
-    ],
-    CURLOPT_TIMEOUT        => 30,
-    CURLOPT_SSL_VERIFYPEER => true,
-]);
+curl_setopt($ch, CURLOPT_URL,            $apiUrl . '/api/verify-payment');
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_POST,           true);
+curl_setopt($ch, CURLOPT_POSTFIELDS,     $verifyPayload);
+curl_setopt($ch, CURLOPT_HTTPHEADER,     array(
+    'RT-UDDOKTAPAY-API-KEY: ' . $apiKey,
+    'Content-Type: application/json',
+    'Accept: application/json',
+));
+curl_setopt($ch, CURLOPT_TIMEOUT,        30);
+curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
 
 $verifyResponse = curl_exec($ch);
-$httpCode       = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+$httpCode       = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
 $curlError      = curl_error($ch);
 curl_close($ch);
 
+// Handle cURL-level failure (DNS, timeout, SSL, etc.)
 if ($curlError) {
-    logTransaction($gatewayModuleName, $ipnData, 'Failed: cURL error — ' . $curlError);
+    logTransaction($gatewayModuleName, $ipnData, 'Failed: cURL error during verification — ' . $curlError);
     http_response_code(500);
-    die('Verification request failed: ' . $curlError);
+    die('UddoktaPay: Could not reach verification API.');
 }
 
 $verifyResult = json_decode($verifyResponse, true);
 
-// Payment must be COMPLETED to proceed
-$paymentStatus = isset($verifyResult['status']) ? strtoupper($verifyResult['status']) : '';
-
-if ($httpCode !== 200 || $paymentStatus !== 'COMPLETED') {
-    $message = isset($verifyResult['message']) ? $verifyResult['message'] : 'Verification failed (HTTP ' . $httpCode . ')';
-    logTransaction($gatewayModuleName, $verifyResult, 'Failed: ' . $message);
-    http_response_code(400);
-    die('Payment verification failed: ' . $message);
+if (!is_array($verifyResult)) {
+    $verifyResult = array();
 }
 
-// -----------------------------------------------------------------------
-// Step 3 — Extract WHMCS invoice ID from metadata
-// We stored whmcs_invoice_id in the metadata when creating the payment.
-// -----------------------------------------------------------------------
-$metadata       = isset($verifyResult['metadata']) ? $verifyResult['metadata'] : [];
+// Payment status must be COMPLETED
+$paymentStatus = isset($verifyResult['status']) ? strtoupper(trim($verifyResult['status'])) : '';
+
+if ($httpCode !== 200 || $paymentStatus !== 'COMPLETED') {
+    $errorMsg = isset($verifyResult['message']) ? $verifyResult['message'] : 'Verification failed (HTTP ' . $httpCode . ')';
+    logTransaction($gatewayModuleName, $verifyResult, 'Failed: ' . $errorMsg);
+    http_response_code(400);
+    die('UddoktaPay: Payment not verified — ' . $errorMsg);
+}
+
+// ---------------------------------------------------------------------------
+// STEP 3 — Recover the WHMCS invoice ID from the response metadata
+//
+// We embedded whmcs_invoice_id in the metadata when initiating the payment.
+// ---------------------------------------------------------------------------
+$metadata       = isset($verifyResult['metadata']) ? $verifyResult['metadata'] : array();
 $whmcsInvoiceId = isset($metadata['whmcs_invoice_id']) ? (int) $metadata['whmcs_invoice_id'] : 0;
 
 if ($whmcsInvoiceId <= 0) {
-    logTransaction($gatewayModuleName, $verifyResult, 'Failed: whmcs_invoice_id missing from metadata');
+    logTransaction($gatewayModuleName, $verifyResult, 'Failed: whmcs_invoice_id not found in metadata');
     http_response_code(400);
-    die('Cannot determine WHMCS invoice ID.');
+    die('UddoktaPay: Cannot resolve WHMCS invoice ID.');
 }
 
-$paymentAmount = isset($verifyResult['amount']) ? $verifyResult['amount'] : 0;
-$transactionId = $uddoktaInvoiceId; // Use UddoktaPay invoice ID as the transaction reference
+// Paid amount from verified API response
+$paymentAmount = isset($verifyResult['amount']) ? floatval($verifyResult['amount']) : 0.00;
 
-// -----------------------------------------------------------------------
-// Step 4 — Record payment in WHMCS
-// WHMCS helper functions handle duplicate checks and invoice updates.
-// -----------------------------------------------------------------------
+// Use the UddoktaPay invoice ID as the unique transaction reference in WHMCS
+$transactionId = $uddoktaInvoiceId;
 
-// Validate the invoice exists and belongs to this gateway
+// ---------------------------------------------------------------------------
+// STEP 4 — Record payment in WHMCS
+//
+// WHMCS built-in helpers prevent duplicate payments and update the invoice.
+// ---------------------------------------------------------------------------
+
+// Confirm the WHMCS invoice exists (throws error if not found)
 $whmcsInvoiceId = checkCbInvoiceID($whmcsInvoiceId, $gatewayModuleName);
 
-// Prevent duplicate transaction recording
+// Block duplicate transaction IDs from being recorded twice
 checkCbTransID($transactionId);
 
-// Mark invoice as paid
+// Mark the invoice as paid
 addInvoicePayment(
-    $whmcsInvoiceId,   // WHMCS invoice ID
-    $transactionId,    // Unique transaction reference
-    $paymentAmount,    // Amount paid
-    0,                 // Transaction fee (0 if not provided)
-    $gatewayModuleName // Gateway module name
+    $whmcsInvoiceId,    // WHMCS invoice ID (integer)
+    $transactionId,     // Unique transaction reference string
+    $paymentAmount,     // Amount paid (float)
+    0,                  // Gateway fee — 0 unless UddoktaPay provides it
+    $gatewayModuleName  // Must match module filename
 );
 
 logTransaction($gatewayModuleName, $verifyResult, 'Successful');
